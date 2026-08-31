@@ -1,0 +1,12 @@
+[package]
+name = "verify-sandbox-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+verify-sandbox-isolation = { path = "../isolation" }
+verify-sandbox-protocol = { path = "../protocol" }
+
+[lints]
+workspace = true
