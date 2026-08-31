@@ -1,7 +1,7 @@
 //! Execution orchestration without policy or provider integrations.
 
-use verify_sandbox_isolation::{ExecutionBackend, IsolationConfig};
-use verify_sandbox_protocol::SandboxJobRequest;
+use verify_sandbox_isolation::{CancellationToken, ExecutionBackend, IsolationConfig};
+use verify_sandbox_protocol::{SandboxJobRequest, SandboxJobResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lifecycle {
@@ -36,6 +36,22 @@ impl<B: ExecutionBackend> Runner<B> {
         request.validate().map_err(|_| "invalid request")?;
         self.backend.provision(request)
     }
+
+    /// Executes after validation and provisioning have both succeeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation, provisioning, or backend execution fails.
+    pub fn execute(
+        &self,
+        request: &SandboxJobRequest,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<SandboxJobResult, String> {
+        self.prepare(request).map_err(str::to_owned)?;
+        self.backend
+            .execute(request, cancellation)
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -67,7 +83,7 @@ mod tests {
 
     #[test]
     fn prepare_validates_request() {
-        let runner = Runner::new(DockerBackend);
+        let runner = Runner::new(DockerBackend::default());
         let mut bad = request();
         bad.resource_limits.timeout_ms = 0;
         assert!(runner.prepare(&bad).is_err());

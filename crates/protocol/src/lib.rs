@@ -44,6 +44,39 @@ pub enum ArtifactPolicy {
     Declared,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxStatus {
+    Completed,
+    Failed,
+    #[serde(rename = "timed_out")]
+    TimedOut,
+    Cancelled,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceUsage {
+    pub memory_bytes: u64,
+    pub cpu_time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxJobResult {
+    pub schema_version: String,
+    pub job_id: String,
+    pub status: SandboxStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    pub logs_ref: String,
+    pub artifact_refs: Vec<String>,
+    pub resource_usage: ResourceUsage,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RequestError {
     #[error("schema version must be 1.0.0")]
@@ -56,6 +89,19 @@ pub enum RequestError {
     CommandTooLong,
     #[error("network and artifact policies must be explicit")]
     UnsafePolicy,
+    #[error("source and job identifiers must be non-empty")]
+    EmptyIdentity,
+    #[error("request field violates contract constraints")]
+    InvalidField,
+}
+
+fn valid_identifier(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.chars().enumerate().all(|(index, character)| {
+            character.is_ascii_alphanumeric()
+                || (index > 0 && matches!(character, '.' | '_' | ':' | '-'))
+        })
 }
 
 impl SandboxJobRequest {
@@ -67,6 +113,16 @@ impl SandboxJobRequest {
     pub fn validate(&self) -> Result<(), RequestError> {
         if self.schema_version != "1.0.0" {
             return Err(RequestError::UnsupportedVersion);
+        }
+        if !valid_identifier(&self.job_id, 256)
+            || self.source.provider.is_empty()
+            || self.source.provider.len() > 64
+            || self.source.reference.is_empty()
+            || self.source.reference.len() > 2048
+            || self.snapshot.is_empty()
+            || self.snapshot.len() > 256
+        {
+            return Err(RequestError::InvalidField);
         }
         if self.commands.is_empty() || self.commands.iter().any(String::is_empty) {
             return Err(RequestError::EmptyCommands);
