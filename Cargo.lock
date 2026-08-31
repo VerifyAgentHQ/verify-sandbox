@@ -135,6 +135,7 @@ dependencies = [
 name = "verify-sandbox-runner"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "verify-sandbox-isolation",
  "verify-sandbox-protocol",
 ]
