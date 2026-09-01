@@ -18,6 +18,9 @@ use verify_sandbox_protocol::{ArtifactPolicy, NetworkPolicy, SandboxJobRequest, 
 const MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_WORKSPACE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_MATERIALIZED_FILES: u64 = 100_000;
+const MAX_MATERIALIZED_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_MATERIALIZED_PATH_BYTES: usize = 4096;
 const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 
 #[allow(clippy::struct_excessive_bools)]
@@ -144,6 +147,95 @@ impl SourceMaterializer for EmptySourceMaterializer {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MaterializationLimits {
+    pub max_total_bytes: u64,
+    pub max_files: u64,
+    pub max_file_bytes: u64,
+    pub max_path_bytes: usize,
+}
+
+impl Default for MaterializationLimits {
+    fn default() -> Self {
+        Self {
+            max_total_bytes: MAX_WORKSPACE_BYTES,
+            max_files: MAX_MATERIALIZED_FILES,
+            max_file_bytes: MAX_MATERIALIZED_FILE_BYTES,
+            max_path_bytes: MAX_MATERIALIZED_PATH_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalSnapshotStoreMaterializer {
+    root: PathBuf,
+    limits: MaterializationLimits,
+}
+
+impl LocalSnapshotStoreMaterializer {
+    /// Creates a materializer whose snapshot IDs resolve beneath `root` only.
+    /// The caller must supply this root from trusted operator configuration.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            limits: MaterializationLimits::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_limits(root: PathBuf, limits: MaterializationLimits) -> Self {
+        Self { root, limits }
+    }
+
+    fn source_for(&self, snapshot: &str) -> Result<PathBuf, BackendError> {
+        if snapshot.is_empty()
+            || snapshot.len() > 256
+            || !snapshot.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+            || snapshot == "."
+            || snapshot == ".."
+        {
+            return Err(BackendError::InvalidRequest("unsafe snapshot id".into()));
+        }
+        if is_indirection(&fs::symlink_metadata(&self.root)?) {
+            return Err(BackendError::Materialization(
+                "snapshot store indirection rejected".into(),
+            ));
+        }
+        let root = fs::canonicalize(&self.root)
+            .map_err(|_| BackendError::Materialization("snapshot store unavailable".into()))?;
+        let source = root.join(snapshot);
+        if is_indirection(&fs::symlink_metadata(&source)?) {
+            return Err(BackendError::Materialization(
+                "source snapshot indirection rejected".into(),
+            ));
+        }
+        let canonical = fs::canonicalize(&source)
+            .map_err(|_| BackendError::Materialization("source snapshot not found".into()))?;
+        if !canonical.starts_with(&root) || is_indirection(&fs::symlink_metadata(&canonical)?) {
+            return Err(BackendError::Materialization(
+                "unsafe source snapshot".into(),
+            ));
+        }
+        Ok(canonical)
+    }
+}
+
+impl SourceMaterializer for LocalSnapshotStoreMaterializer {
+    fn materialize(&self, snapshot: &str, destination: &Path) -> Result<(), BackendError> {
+        let source = self.source_for(snapshot)?;
+        if is_indirection(&fs::symlink_metadata(destination)?) {
+            return Err(BackendError::Materialization(
+                "destination indirection rejected".into(),
+            ));
+        }
+        copy_tree_with_limits(&source, destination, self.limits)
+            .map_err(|error| BackendError::Materialization(error.to_string()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DirectorySourceMaterializer {
     root: PathBuf,
@@ -163,13 +255,23 @@ impl SourceMaterializer for DirectorySourceMaterializer {
                 "source root symlink rejected".into(),
             ));
         }
-        copy_tree(&self.root, destination)
+        copy_tree_with_limits(&self.root, destination, MaterializationLimits::default())
             .map_err(|error| BackendError::Materialization(error.to_string()))
     }
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
-    fn copy_tree_bounded(source: &Path, destination: &Path, used: &mut u64) -> io::Result<()> {
+fn copy_tree_with_limits(
+    source: &Path,
+    destination: &Path,
+    limits: MaterializationLimits,
+) -> io::Result<()> {
+    fn copy_tree_bounded(
+        source: &Path,
+        destination: &Path,
+        used: &mut u64,
+        files: &mut u64,
+        limits: MaterializationLimits,
+    ) -> io::Result<()> {
         for entry in fs::read_dir(source)? {
             let entry = entry?;
             let metadata = fs::symlink_metadata(entry.path())?;
@@ -177,14 +279,29 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
                 return Err(io::Error::other("source symlink or reparse point rejected"));
             }
             let target = destination.join(entry.file_name());
+            let relative = target
+                .strip_prefix(destination)
+                .map_err(|_| io::Error::other("destination path escaped root"))?;
+            if relative.as_os_str().to_string_lossy().len() > limits.max_path_bytes {
+                return Err(io::Error::other("source path length exceeded"));
+            }
             if metadata.file_type().is_dir() {
                 fs::create_dir_all(&target)?;
-                copy_tree_bounded(&entry.path(), &target, used)?;
+                copy_tree_bounded(&entry.path(), &target, used, files, limits)?;
             } else if metadata.file_type().is_file() {
+                if metadata.len() > limits.max_file_bytes {
+                    return Err(io::Error::other("source file size exceeded"));
+                }
+                *files = files
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("source file count overflow"))?;
+                if *files > limits.max_files {
+                    return Err(io::Error::other("source file count exceeded"));
+                }
                 *used = used
                     .checked_add(metadata.len())
                     .ok_or_else(|| io::Error::other("source size overflow"))?;
-                if *used > MAX_WORKSPACE_BYTES {
+                if *used > limits.max_total_bytes {
                     return Err(io::Error::other("source workspace size exceeded"));
                 }
                 fs::copy(entry.path(), target)?;
@@ -196,7 +313,8 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
     }
 
     let mut used = 0;
-    copy_tree_bounded(source, destination, &mut used)
+    let mut files = 0;
+    copy_tree_bounded(source, destination, &mut used, &mut files, limits)
 }
 
 #[cfg(windows)]
@@ -408,7 +526,23 @@ impl<M: SourceMaterializer> DockerBackend<M> {
             "--user".into(),
             "65532:65532".into(),
             "--tmpfs".into(),
-            "/workspace:rw,nosuid,nodev,size=1g".into(),
+            "/workspace:rw,nosuid,nodev,size=1g,uid=65532,gid=65532,mode=700".into(),
+            "--tmpfs".into(),
+            "/cargo-home:rw,nosuid,nodev,size=512m".into(),
+            "--tmpfs".into(),
+            "/pnpm-home:rw,nosuid,nodev,size=512m".into(),
+            "--tmpfs".into(),
+            "/tmp:rw,nosuid,nodev,size=256m".into(),
+            "--env".into(),
+            "HOME=/tmp/home".into(),
+            "--env".into(),
+            "CARGO_HOME=/cargo-home".into(),
+            "--env".into(),
+            "PNPM_HOME=/pnpm-home".into(),
+            "--env".into(),
+            "npm_config_cache=/pnpm-home/npm-cache".into(),
+            "--env".into(),
+            "XDG_CACHE_HOME=/pnpm-home/xdg-cache".into(),
             self.config.image.clone(),
             "sleep".into(),
             "2147483647".into(),
@@ -425,16 +559,7 @@ impl<M: SourceMaterializer> DockerBackend<M> {
                 String::from_utf8_lossy(&started.stderr).into_owned(),
             ));
         }
-        let copied = self.docker(&[
-            "cp".into(),
-            format!("{}{}", workspace.display(), "\\."),
-            format!("{name}:/workspace"),
-        ])?;
-        if !copied.status.success() {
-            return Err(BackendError::Docker(
-                String::from_utf8_lossy(&copied.stderr).into_owned(),
-            ));
-        }
+        copy_workspace(&self.config.docker_executable, name, workspace)?;
         let total_started = Instant::now();
         let mut truncated = false;
         for command in commands {
@@ -498,6 +623,174 @@ impl<M: SourceMaterializer> DockerBackend<M> {
             truncated,
         ))
     }
+}
+
+fn copy_workspace(
+    docker_executable: &Path,
+    name: &str,
+    workspace: &Path,
+) -> Result<(), BackendError> {
+    // docker cp writes the container rootfs directly and fails with
+    // --read-only, even when /workspace is a writable tmpfs. Extract through
+    // docker exec so writes land in the explicitly mounted tmpfs.
+    let mut child = Command::new(docker_executable)
+        .args([
+            "exec",
+            "--interactive",
+            name,
+            "tar",
+            "-x",
+            "-f",
+            "-",
+            "-C",
+            "/workspace",
+        ])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| BackendError::Docker("workspace transfer pipe unavailable".into()))?;
+    write_tar(workspace, &mut input)?;
+    drop(input);
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(BackendError::Docker(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_tar(root: &Path, output: &mut impl io::Write) -> Result<(), BackendError> {
+    fn visit(root: &Path, path: &Path, output: &mut impl io::Write) -> Result<(), BackendError> {
+        let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let entry_path = entry.path();
+            let relative = entry_path
+                .strip_prefix(root)
+                .map_err(|_| BackendError::Materialization("workspace path escaped root".into()))?;
+            let name = relative.to_string_lossy().replace('\\', "/");
+            let metadata = fs::symlink_metadata(&entry_path)?;
+            validate_archive_path(&name)?;
+            if metadata.file_type().is_dir() {
+                tar_path_header(output, &name, 0, b'5')?;
+                visit(root, &entry_path, output)?;
+            } else if metadata.file_type().is_file() {
+                tar_path_header(output, &name, metadata.len(), b'0')?;
+                let mut file = fs::File::open(entry_path)?;
+                io::copy(&mut file, output)?;
+                pad_tar(output, metadata.len())?;
+            } else {
+                return Err(BackendError::Materialization(
+                    "unsupported workspace entry".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    visit(root, root, output)?;
+    output.write_all(&[0; 1024])?;
+    Ok(())
+}
+
+fn validate_archive_path(name: &str) -> Result<(), BackendError> {
+    if name.is_empty()
+        || name.starts_with('/')
+        || name.contains('\\')
+        || name.contains(':')
+        || name
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(BackendError::Materialization(
+            "workspace path is not a normalized relative path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn tar_path_header(
+    output: &mut impl io::Write,
+    name: &str,
+    size: u64,
+    kind: u8,
+) -> Result<(), BackendError> {
+    validate_archive_path(name)?;
+    if name.len() > 100 {
+        let record = pax_path_record(name);
+        tar_header(output, "PaxHeaders.0", record.len() as u64, b'x')?;
+        output.write_all(&record)?;
+        pad_tar(output, record.len() as u64)?;
+        tar_header(output, "pax-entry", size, kind)?;
+    } else {
+        tar_header(output, name, size, kind)?;
+    }
+    Ok(())
+}
+
+fn pax_path_record(name: &str) -> Vec<u8> {
+    let payload = format!("path={name}\n");
+    let mut length = payload.len() + 2;
+    loop {
+        let candidate = format!("{length} {payload}");
+        if candidate.len() == length {
+            return candidate.into_bytes();
+        }
+        length = candidate.len();
+    }
+}
+
+fn tar_header(
+    output: &mut impl io::Write,
+    name: &str,
+    size: u64,
+    kind: u8,
+) -> Result<(), BackendError> {
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() > 100 {
+        return Err(BackendError::Materialization(
+            "tar header name is too long".into(),
+        ));
+    }
+    let mut header = [0_u8; 512];
+    header[..name_bytes.len()].copy_from_slice(name_bytes);
+    write_octal(&mut header[100..108], 0o755);
+    write_octal(&mut header[108..116], 65532);
+    write_octal(&mut header[116..124], 65532);
+    write_octal(&mut header[124..136], size);
+    write_octal(&mut header[136..148], 0);
+    header[148..156].fill(b' ');
+    header[156] = kind;
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    write_octal(&mut header[148..156], u64::from(checksum));
+    output.write_all(&header)?;
+    Ok(())
+}
+
+fn write_octal(field: &mut [u8], value: u64) {
+    field.fill(b'0');
+    let digits = format!("{value:o}");
+    let start = field.len().saturating_sub(digits.len() + 1);
+    field[start..start + digits.len()].copy_from_slice(digits.as_bytes());
+    field[field.len() - 1] = 0;
+}
+
+fn pad_tar(output: &mut impl io::Write, size: u64) -> Result<(), BackendError> {
+    let padding = (512 - (size % 512)) % 512;
+    if padding > 0 {
+        let padding = usize::try_from(padding)
+            .map_err(|_| BackendError::Materialization("tar padding overflow".into()))?;
+        output.write_all(&vec![0; padding])?;
+    }
+    Ok(())
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -740,6 +1033,144 @@ mod tests {
         let command =
             r#"{"executable":"cargo","args":["test"],"workingDirectory":".","environment":{}}"#;
         assert!(backend.execute(&request(command), None).is_err());
+    }
+
+    #[test]
+    fn local_snapshot_store_materializes_only_valid_snapshot_ids() {
+        let base =
+            std::env::temp_dir().join(format!("verify-sandbox-store-{}", std::process::id()));
+        let store = base.join("store");
+        let destination = base.join("destination");
+        fs::create_dir_all(store.join("snap-1/src")).expect("snapshot directory");
+        fs::create_dir_all(&destination).expect("destination directory");
+        fs::write(store.join("snap-1/package.json"), b"{}\n").expect("source file");
+        fs::write(store.join("snap-1/src/index.ts"), b"export {};\n").expect("source file");
+        let materializer = LocalSnapshotStoreMaterializer::new(store.clone());
+        materializer
+            .materialize("snap-1", &destination)
+            .expect("materialization");
+        assert_eq!(fs::read(destination.join("package.json")).unwrap(), b"{}\n");
+        assert_eq!(
+            fs::read(destination.join("src/index.ts")).unwrap(),
+            b"export {};\n"
+        );
+        assert!(materializer.materialize("unknown", &destination).is_err());
+        for id in [
+            "../snap-1",
+            "/tmp/snap-1",
+            "C:/snap-1",
+            "\\\\server\\snap-1",
+        ] {
+            assert!(
+                materializer.materialize(id, &destination).is_err(),
+                "accepted {id}"
+            );
+        }
+        assert_eq!(
+            fs::read(store.join("snap-1/package.json")).unwrap(),
+            b"{}\n"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn materialization_limits_are_enforced() {
+        let base =
+            std::env::temp_dir().join(format!("verify-sandbox-limits-{}", std::process::id()));
+        let source = base.join("source");
+        let destination = base.join("destination");
+        fs::create_dir_all(&source).expect("source directory");
+        fs::create_dir_all(&destination).expect("destination directory");
+        fs::write(source.join("one"), b"12345").expect("source file");
+        let limits = MaterializationLimits {
+            max_total_bytes: 4,
+            max_files: 1,
+            max_file_bytes: 4,
+            max_path_bytes: 32,
+        };
+        assert!(copy_tree_with_limits(&source, &destination, limits).is_err());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn archive_paths_are_normalized_relative_paths() {
+        for path in [
+            "../x",
+            "/x",
+            "C:/x",
+            "//server/x",
+            "nested/../x",
+            "nested\\x",
+        ] {
+            assert!(
+                validate_archive_path(path).is_err(),
+                "accepted unsafe path: {path}"
+            );
+        }
+        assert!(validate_archive_path("nested/path.txt").is_ok());
+    }
+
+    #[test]
+    fn tar_supports_long_paths_and_is_deterministic() {
+        let root = std::env::temp_dir().join(format!("verify-sandbox-tar-{}", std::process::id()));
+        let below_limit = "a".repeat(99);
+        let above_limit = "b".repeat(101);
+        let nested = root.join("deep").join("repository").join("relative");
+        fs::create_dir_all(&nested).expect("nested source directory");
+        fs::write(root.join(&below_limit), b"below").expect("short source file");
+        fs::write(nested.join(&above_limit), b"above").expect("long source file");
+
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        write_tar(&root, &mut first).expect("first tar archive");
+        write_tar(&root, &mut second).expect("second tar archive");
+        assert_eq!(first, second);
+        assert!(String::from_utf8_lossy(&first)
+            .contains(&format!("path=deep/repository/relative/{above_limit}")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore = "requires the approved local runner image and Docker"]
+    fn docker_backend_transfers_a_long_path() {
+        let root =
+            std::env::temp_dir().join(format!("verify-sandbox-docker-{}", std::process::id()));
+        let nested = root.join("nested").join("repository").join("relative");
+        let long_name = "long-file-name-".to_owned() + &"x".repeat(90) + ".txt";
+        fs::create_dir_all(&nested).expect("source directory");
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"long-path-smoke\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"long-path-smoke\"\npath = \"nested/repository/relative/{long_name}\"\n"
+            ),
+        )
+        .expect("manifest");
+        fs::write(nested.join(&long_name), "fn main() {}\n").expect("long path file");
+
+        let backend = DockerBackend::new(
+            DockerConfig::development("verify-agent/runner:development".into()),
+            DirectorySourceMaterializer::new(root.clone()),
+        );
+        let command = r#"{"executable":"cargo","args":["check","--offline","--manifest-path","Cargo.toml"],"workingDirectory":".","environment":{}}"#;
+        let mut smoke_request = request(command);
+        smoke_request.resource_limits.timeout_ms = 30_000;
+        smoke_request.resource_limits.memory_limit_bytes = 1024 * 1024 * 1024;
+        let result = backend
+            .execute(&smoke_request, None)
+            .expect("Docker execution");
+        assert_eq!(
+            result.status,
+            verify_sandbox_protocol::SandboxStatus::Completed,
+            "backend errors: {:?}",
+            result.errors
+        );
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "backend errors: {:?}",
+            result.errors
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

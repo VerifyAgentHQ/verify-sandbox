@@ -16,3 +16,13 @@ jobs:
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  runner-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build runner image
+        run: docker build --pull=false --platform linux/amd64 --file infrastructure/runner/Dockerfile --tag verify-agent/runner:development infrastructure/runner
+      - name: Verify runner image
+        shell: pwsh
+        run: ./scripts/verify-runner-image.ps1
