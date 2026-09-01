@@ -4,6 +4,12 @@ This project is a security boundary for untrusted code. See [THREAT-MODEL.md](TH
 
 The Docker backend fails closed on invalid requests and unsafe isolation configuration. It defaults to no network, explicit JSON argv commands, no inherited environment, non-root/non-privileged execution, no Docker socket, no host bind mounts, read-only root with a bounded temporary workspace, bounded processes/output, and ephemeral workspaces. Only preconfigured syntactically safe image references and `pnpm`/`cargo` executables are accepted; image pulls and arbitrary repository commands are not supported.
 
+The process entrypoint requires the trusted operator configuration
+`VERIFY_SANDBOX_DOCKER_EXECUTABLE`. It must be an existing absolute Docker CLI
+file and cannot be selected or overridden by a sandbox request. Docker child
+processes retain `env_clear()`, so Docker resolution does not depend on ambient
+host `PATH` or inherited secrets; invalid or missing configuration fails closed.
+
 The development image is repository-owned and built from
 `infrastructure/runner/Dockerfile`; it is not pulled automatically. Its pinned
 toolchain versions and verification procedure are documented in
@@ -31,3 +37,11 @@ Do not weaken controls to make local development convenient. Backend caps are on
 Report suspected vulnerabilities privately to the repository maintainers; do not disclose exploitable details in a public issue until coordinated disclosure is agreed.
 
 CI status: Phase 0 formatting, lint, and unit tests pass locally (`cargo fmt`, `cargo clippy`, `cargo test`).
+
+If an explicit daemon endpoint is required, `VERIFY_SANDBOX_DOCKER_HOST` is
+operator configuration and is passed only as `DOCKER_HOST` to Docker CLI
+children. No general host environment or Docker credentials are inherited.
+
+On Windows, `VERIFY_SANDBOX_SYSTEM_ROOT` may be supplied explicitly for native
+Docker CLI process loading; it is the only additional platform runtime value
+passed to those children.

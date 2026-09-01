@@ -333,6 +333,9 @@ fn is_indirection(metadata: &fs::Metadata) -> bool {
 #[derive(Debug, Clone)]
 pub struct DockerConfig {
     pub docker_executable: PathBuf,
+    pub docker_host: Option<String>,
+    pub system_root: Option<String>,
+    pub temp_root: Option<PathBuf>,
     pub image: String,
     pub pids_limit: u64,
     pub cpu_limit: f64,
@@ -345,8 +348,16 @@ pub struct DockerConfig {
 impl DockerConfig {
     #[must_use]
     pub fn development(image: String) -> Self {
+        Self::development_with_executable(image, PathBuf::from("docker"))
+    }
+
+    #[must_use]
+    pub fn development_with_executable(image: String, docker_executable: PathBuf) -> Self {
         Self {
-            docker_executable: PathBuf::from("docker"),
+            docker_executable,
+            docker_host: None,
+            system_root: None,
+            temp_root: None,
             image,
             pids_limit: 256,
             cpu_limit: 1.0,
@@ -358,6 +369,41 @@ impl DockerConfig {
     }
 
     fn validate(&self) -> Result<(), BackendError> {
+        if !self.docker_executable.is_absolute() || !self.docker_executable.is_file() {
+            return Err(BackendError::UnsafeConfiguration(
+                "Docker executable must be an existing absolute file".into(),
+            ));
+        }
+        if self
+            .docker_host
+            .as_deref()
+            .is_some_and(|host| host.is_empty() || host.contains('\0'))
+        {
+            return Err(BackendError::UnsafeConfiguration(
+                "Docker host configuration is invalid".into(),
+            ));
+        }
+        if self
+            .system_root
+            .as_deref()
+            .is_some_and(|root| root.is_empty() || root.contains('\0'))
+        {
+            return Err(BackendError::UnsafeConfiguration(
+                "system root configuration is invalid".into(),
+            ));
+        }
+        if let Some(root) = &self.temp_root {
+            if !root.is_absolute()
+                || !root.is_dir()
+                || is_indirection(&fs::symlink_metadata(root).map_err(|_| {
+                    BackendError::UnsafeConfiguration("temporary root is unavailable".into())
+                })?)
+            {
+                return Err(BackendError::UnsafeConfiguration(
+                    "temporary root must be an existing absolute directory".into(),
+                ));
+            }
+        }
         if self.image.trim().is_empty()
             || !self
                 .image
@@ -427,11 +473,19 @@ impl<M: SourceMaterializer> DockerBackend<M> {
     }
 
     fn docker(&self, args: &[String]) -> Result<std::process::Output, BackendError> {
-        Command::new(&self.config.docker_executable)
-            .args(args)
-            .env_clear()
-            .output()
-            .map_err(BackendError::Io)
+        let mut command = Command::new(&self.config.docker_executable);
+        command.args(args).env_clear();
+        if let Some(parent) = self.config.docker_executable.parent() {
+            let path = parent.as_os_str();
+            command.env("PATH", path).env("Path", path);
+        }
+        if let Some(host) = &self.config.docker_host {
+            command.env("DOCKER_HOST", host);
+        }
+        if let Some(root) = &self.config.system_root {
+            command.env("SystemRoot", root);
+        }
+        command.output().map_err(BackendError::Io)
     }
 
     fn cleanup(&self, name: &str) -> Result<(), BackendError> {
@@ -481,7 +535,7 @@ impl<M: SourceMaterializer> DockerBackend<M> {
         }
         let commands = parse_commands(request)?;
         let name = Self::container_name(&request.job_id)?;
-        let workspace = unique_temp_dir(&request.job_id)?;
+        let workspace = unique_temp_dir(&request.job_id, self.config.temp_root.as_deref())?;
         let result = match self.execute_inner(request, &commands, &name, &workspace, cancellation) {
             Ok(result) => result,
             Err(error) => error_result(request, &error),
@@ -559,7 +613,13 @@ impl<M: SourceMaterializer> DockerBackend<M> {
                 String::from_utf8_lossy(&started.stderr).into_owned(),
             ));
         }
-        copy_workspace(&self.config.docker_executable, name, workspace)?;
+        copy_workspace(
+            &self.config.docker_executable,
+            self.config.docker_host.as_deref(),
+            self.config.system_root.as_deref(),
+            name,
+            workspace,
+        )?;
         let total_started = Instant::now();
         let mut truncated = false;
         for command in commands {
@@ -571,12 +631,23 @@ impl<M: SourceMaterializer> DockerBackend<M> {
                 command.executable.clone(),
             ];
             args.extend(command.args.clone());
-            let mut child = Command::new(&self.config.docker_executable)
+            let mut child = Command::new(&self.config.docker_executable);
+            child
                 .args(args)
                 .env_clear()
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
+                .stderr(Stdio::piped());
+            if let Some(parent) = self.config.docker_executable.parent() {
+                let path = parent.as_os_str();
+                child.env("PATH", path).env("Path", path);
+            }
+            if let Some(host) = &self.config.docker_host {
+                child.env("DOCKER_HOST", host);
+            }
+            if let Some(root) = &self.config.system_root {
+                child.env("SystemRoot", root);
+            }
+            let mut child = child.spawn()?;
             let stdout = child
                 .stdout
                 .take()
@@ -627,13 +698,16 @@ impl<M: SourceMaterializer> DockerBackend<M> {
 
 fn copy_workspace(
     docker_executable: &Path,
+    docker_host: Option<&str>,
+    system_root: Option<&str>,
     name: &str,
     workspace: &Path,
 ) -> Result<(), BackendError> {
     // docker cp writes the container rootfs directly and fails with
     // --read-only, even when /workspace is a writable tmpfs. Extract through
     // docker exec so writes land in the explicitly mounted tmpfs.
-    let mut child = Command::new(docker_executable)
+    let mut child = Command::new(docker_executable);
+    child
         .args([
             "exec",
             "--interactive",
@@ -645,7 +719,18 @@ fn copy_workspace(
             "-C",
             "/workspace",
         ])
-        .env_clear()
+        .env_clear();
+    if let Some(host) = docker_host {
+        child.env("DOCKER_HOST", host);
+    }
+    if let Some(root) = system_root {
+        child.env("SystemRoot", root);
+    }
+    if let Some(parent) = docker_executable.parent() {
+        let path = parent.as_os_str();
+        child.env("PATH", path).env("Path", path);
+    }
+    let mut child = child
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -797,12 +882,13 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn unique_temp_dir(job_id: &str) -> Result<PathBuf, BackendError> {
+fn unique_temp_dir(job_id: &str, configured_root: Option<&Path>) -> Result<PathBuf, BackendError> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| BackendError::Materialization("clock failure".into()))?
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("verify-agent-{job_id}-{nonce}"));
+    let root = configured_root.map_or_else(std::env::temp_dir, Path::to_path_buf);
+    let path = root.join(format!("verify-agent-{job_id}-{nonce}"));
     fs::create_dir(&path)?;
     Ok(path)
 }
@@ -1033,6 +1119,40 @@ mod tests {
         let command =
             r#"{"executable":"cargo","args":["test"],"workingDirectory":".","environment":{}}"#;
         assert!(backend.execute(&request(command), None).is_err());
+    }
+
+    #[test]
+    fn explicit_docker_executable_must_be_an_existing_absolute_file() {
+        let executable = std::env::current_exe().expect("test executable");
+        let config = DockerConfig::development_with_executable(
+            "verify-agent/runner:development".into(),
+            executable,
+        );
+        assert!(config.validate().is_ok());
+
+        let missing = DockerConfig::development_with_executable(
+            "verify-agent/runner:development".into(),
+            std::env::temp_dir().join("missing-docker-executable"),
+        );
+        assert!(missing.validate().is_err());
+
+        let relative = DockerConfig::development_with_executable(
+            "verify-agent/runner:development".into(),
+            PathBuf::from("docker"),
+        );
+        assert!(relative.validate().is_err());
+    }
+
+    #[test]
+    fn request_cannot_override_docker_executable() {
+        let backend = DockerBackend::default();
+        let command = r#"{"executable":"cargo","args":["--version"],"workingDirectory":".","environment":{}}"#;
+        let mut request = request(command);
+        request.commands.push(
+            r#"{"executable":"docker","args":["--privileged"],"workingDirectory":".","environment":{}}"#
+                .into(),
+        );
+        assert!(backend.execute(&request, None).is_err());
     }
 
     #[test]

@@ -24,4 +24,19 @@ local/integration snapshots. The public `snapshot` field remains an opaque
 identity, not a filesystem path. Materialization is read-only at the source and
 is cleaned with the host staging directory after execution.
 
+The process also requires the operator-only `VERIFY_SANDBOX_DOCKER_EXECUTABLE`
+setting. It must name an existing absolute Docker CLI file. Docker is invoked
+through this validated path with a cleared environment; no inherited `PATH` or
+host secrets are needed. Missing, relative, or nonexistent configuration fails
+closed before execution.
+
 Requests should be idempotent by `jobId`: duplicate delivery must not reuse a workspace or cause an ambiguous second execution. Exactly-once execution requires control-plane coordination and is not claimed here. Cancellation is best effort and must still end in cleanup and a terminal public result.
+
+On hosts where Docker requires an explicit daemon endpoint, the operator may also
+set `VERIFY_SANDBOX_DOCKER_HOST` (for example, the configured local Docker
+Desktop named pipe). This value is passed only as an explicit `DOCKER_HOST`
+variable to Docker CLI children; the host environment remains cleared.
+
+On Windows, the operator may additionally provide `VERIFY_SANDBOX_SYSTEM_ROOT`
+when required by native process loading. It is passed only as `SystemRoot` to
+Docker CLI children and is never read from the job request.
