@@ -25,6 +25,20 @@ RUN npm install --global pnpm@${PNPM_VERSION} \
     && npm cache clean --force \
     && pnpm --version
 
+# Install TypeScript and Vitest globally so fixture snapshots can use minimal
+# wrapper scripts in node_modules/.bin/ instead of shipping full node_modules.
+# These are the only additional runtimes the TypeScript truth fixtures require.
+ARG TYPESCRIPT_VERSION=5.8.3
+ARG VITEST_VERSION=2.1.9
+RUN npm install --global typescript@${TYPESCRIPT_VERSION} vitest@${VITEST_VERSION} \
+    && npm cache clean --force \
+    && tsc --version \
+    && vitest --version
+
+# NODE_PATH enables vitest to resolve its own imports (e.g. "vitest/config")
+# from the global installation when invoked via wrapper scripts.
+ENV NODE_PATH=/usr/local/lib/node_modules
+
 # Copy only the Rust toolchain needed by the approved cargo command. The final
 # image intentionally does not contain the Rust image's build-layer packages.
 COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
