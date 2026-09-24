@@ -49,7 +49,7 @@ ENV CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes passwd \
+    && apt-get install --no-install-recommends --yes passwd gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 65532 runner \
     && useradd --uid 65532 --gid 65532 --create-home --home-dir /home/runner \
@@ -60,6 +60,25 @@ RUN apt-get update \
     && pnpm --version \
     && cargo --version \
     && rustc --version
+
+# Install wasm32-unknown-unknown target required by soroban-sdk.
+RUN rustup target add wasm32-unknown-unknown
+
+# Install CA certificates for crates.io HTTPS access.
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-fetch soroban-sdk and its transitive dependencies into the cargo registry
+# so that `cargo test --offline` can resolve them without network access.
+# Uses a repository-owned provisioning project with an exact lockfile to ensure
+# deterministic dependency resolution matching the VerifyAgent Soroban fixtures.
+COPY provisioning/ /tmp/soroban-provision/
+RUN cd /tmp/soroban-provision && \
+    cargo fetch --locked 2>&1 && \
+    chmod -R a+r /usr/local/cargo/registry && \
+    cd / && \
+    rm -rf /tmp/soroban-provision
 
 USER 65532:65532
 WORKDIR /workspace
