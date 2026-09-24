@@ -580,9 +580,9 @@ impl<M: SourceMaterializer> DockerBackend<M> {
             "--user".into(),
             "65532:65532".into(),
             "--tmpfs".into(),
-            "/workspace:rw,nosuid,nodev,size=1g,uid=65532,gid=65532,mode=700".into(),
+            "/workspace:rw,exec,nosuid,nodev,size=1g,uid=65532,gid=65532,mode=700".into(),
             "--tmpfs".into(),
-            "/cargo-home:rw,nosuid,nodev,size=512m".into(),
+            "/cargo-home:rw,nosuid,nodev,size=512m,uid=65532,gid=65532,mode=700".into(),
             "--tmpfs".into(),
             "/pnpm-home:rw,nosuid,nodev,size=512m".into(),
             "--tmpfs".into(),
@@ -620,6 +620,23 @@ impl<M: SourceMaterializer> DockerBackend<M> {
             name,
             workspace,
         )?;
+        // Bootstrap CARGO_HOME by copying the pre-populated registry from the
+        // immutable image layer into the writable /cargo-home tmpfs. This allows
+        // cargo test --offline to write .cargo-ok metadata files without modifying
+        // the read-only root filesystem.
+        let bootstrap = self.docker(&[
+            "exec".into(),
+            name.into(),
+            "sh".into(),
+            "-c".into(),
+            "cp -a /usr/local/cargo/registry /cargo-home/registry".into(),
+        ])?;
+        if !bootstrap.status.success() {
+            return Err(BackendError::Docker(format!(
+                "cargo home bootstrap failed: {}",
+                String::from_utf8_lossy(&bootstrap.stderr)
+            )));
+        }
         let total_started = Instant::now();
         let mut truncated = false;
         for command in commands {
